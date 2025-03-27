@@ -4,7 +4,7 @@ import json
 import os
 import re
 from cmd import Cmd
-from minio import Minio
+import boto3
 from canedge_manager import CANedge, CANedgeReturnCodes
 
 class CANedgeCli(Cmd):
@@ -47,21 +47,29 @@ class CANedgeCli(Cmd):
             raise Exception("Server alias not found")
         server_cfg = server_cfgs[args["alias"]]
 
-        # Init S3 client
-        tls = True if server_cfg["url"].find("https") >= 0 else False
+        # Create S3 client
+        tls = server_cfg["url"].find("https") >= 0
 
         # Strip http / https from url
         server_url = server_cfg["url"]
         server_url = server_url.replace("https://", "")
         server_url = server_url.replace("http://", "")
 
-        mc = Minio(endpoint=server_url,
-                   access_key=server_cfg["accessKey"],
-                   secret_key=server_cfg["secretKey"],
-                   secure=tls)
+        # Create boto3 S3 client
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=server_cfg["accessKey"],
+            aws_secret_access_key=server_cfg["secretKey"],
+            endpoint_url=f'{"https" if tls else "http"}://{server_url}'
+        )
 
         # Init CANedge
-        self.ce = CANedge(mc=mc, bucket=args["bucket"], fw_old_path=args["fwcur"], fw_new_path=args["fwnew"])
+        self.ce = CANedge(
+            s3_client=s3_client, 
+            bucket=args["bucket"], 
+            fw_old_path=args["fwcur"], 
+            fw_new_path=args["fwnew"]
+        )
 
         # Info text
         self.intro += f"CANedge manager CLI using CANedge manager API version: {self.ce.tool_version}\n"

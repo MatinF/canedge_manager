@@ -29,33 +29,37 @@ The CANedge module can be imported and used directly to update device firmware a
 
 ```python
 
+import boto3
 from canedge_manager import CANedge
-from minio import Minio
-from config_func_00_07_XX_credential_encryption import config_func as config_func
+from config.config_func_01_09_XX_01_09_XX_credential_encryption import config_func as config_func
 
-#-------------------------------------
 # Add relevant input variables
 devices = ["12345678"]
 bucket = "your-bucket"
 endpoint = "your-endpoint" # e.g. s3.us-east-1.amazonaws.com
 access_key = "your-access-key"
 secret_key = "your-secret-key"
-secure = False
 fw_old_path = "path-to-old/firmware.bin"
-fw_new_path = "path-to-new/firmware.bin"
+fw_new_path = None
 
-#-------------------------------------
-# Create client connection to S3 server
-mc = Minio(endpoint=endpoint,
-           access_key=access_key,
-           secret_key=secret_key,
-           secure=secure)
+# Create S3 client with explicit credentials
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=access_key,
+    aws_secret_access_key=secret_key,
+    endpoint_url=f'https://{endpoint}'
+)
+
+# Alternatively, parse the S3 client based on environment variables
+# s3_client = boto3.client('s3')
 
 # Init a CANedge object
-ce = CANedge(mc=mc,
-             bucket=bucket,
-             fw_old_path=fw_old_path,
-             fw_new_path=fw_new_path)
+ce = CANedge(
+    s3_client=s3_client,
+    bucket=bucket,
+    fw_old_path=fw_old_path,
+    fw_new_path=fw_new_path
+)
 
 # Update configuration for a list of devices
 list(ce.cfg_update(device_ids_to_update=devices, cfg_cb=config_func))
@@ -65,7 +69,6 @@ list(ce.fw_update(device_ids_to_update=devices))
 
 # Cleans unused Configuration and Rule Schema files
 list(ce.cfg_clean())
-
 
 ```
 
@@ -111,7 +114,6 @@ Tips:
 - If the "-s" argument is omitted, the tool searches for a file named "servers.json"
 - If the "-a" argument is omitted, the tool will select the first server alias in server file
 - If used for firmware update to a new major / minor version, first run `config` to create a compatible configuration file
-- MinIO server configuration files can be used directly (-s argument)
 
 The format of the S3 server file is:
 ```

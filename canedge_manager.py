@@ -11,6 +11,7 @@ from Crypto.Hash import HMAC, SHA256
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from Crypto.Random import get_random_bytes
+import boto3
 
 
 class CANedgeReturnCodes(IntEnum):
@@ -105,13 +106,14 @@ class CANedgeTools(object):
     def security(self) -> CANEdgeSecurity:
         return self._security
 
+
 class CANedge(object):
 
     __VERSION = "00.00.03"
 
-    def __init__(self, mc, bucket, fw_old_path, fw_new_path=None):
+    def __init__(self, s3_client, bucket, fw_old_path, fw_new_path=None):
 
-        self.mc = mc
+        self.s3 = s3_client
         self.bucket = bucket
         self.fw_old_path = fw_old_path
         self.fw_new_path = fw_new_path if (fw_new_path is not None) else fw_old_path
@@ -186,30 +188,28 @@ class CANedge(object):
                 "cfg": config}
 
     def __s3_get_obj_string(self, obj_name):
-        data_string = ""
-        data = self.mc.get_object(self.bucket, obj_name)
-        for d in data.stream(1024):
-            data_string += d.decode('ascii')
+        response = self.s3.get_object(Bucket=self.bucket, Key=obj_name)
+        data_string = response['Body'].read().decode('ascii')
         return data_string
 
     def __s3_put_obj_string(self, obj_name, string):
         data = io.BytesIO(string.encode())
-        nob = data.getbuffer().nbytes
-        self.mc.put_object(self.bucket, obj_name, data, nob)
+        self.s3.put_object(Bucket=self.bucket, Key=obj_name, Body=data)
 
     def __s3_get_devices(self) -> Generator[Dict, None, None]:
         """
         Fetch devices on server with matching schema name
         :return:
         """
-        # Loop devices
-        for obj1 in self.mc.list_objects(self.bucket, recursive=False):
-            # Loop device files
-            for obj2 in self.mc.list_objects(self.bucket, prefix=obj1.object_name, recursive=False):
-                r = re.search(r'^([A-F0-9]{8})/device\.json$', obj2.object_name)
+        # List objects in the bucket
+        paginator = self.s3.get_paginator('list_objects_v2')
+        for result in paginator.paginate(Bucket=self.bucket):
+            # Loop through objects
+            for obj in result.get('Contents', []):
+                r = re.search(r'^([A-F0-9]{8})/device\.json$', obj['Key'])
                 if r:
                     # Load device file
-                    device = json.loads(self.__s3_get_obj_string(obj2.object_name))
+                    device = json.loads(self.__s3_get_obj_string(obj['Key']))
 
                     # If type and schema version match, append to output
                     if (device["type"] == self.__fw_old["type"]) and (device["sch_name"] == self.__fw_old["sch_name"]):
@@ -246,7 +246,6 @@ class CANedge(object):
         """
         # Loop devices
         for index, device_id in enumerate(device_ids_to_update):
-
             res = {"res": CANedgeReturnCodes.OK, "id": device_id, "msg": None}
 
             # Check if device id is in list of known devices
@@ -258,7 +257,6 @@ class CANedge(object):
 
             # Get device old config
             cfg_old = self.__s3_get_obj_string(device["id"] + '/' + self.__fw_old["cfg_name"])
-
             # Parse json
             cfg_old_obj = json.loads(cfg_old, object_pairs_hook=OrderedDict)
             cfg_new_obj = json.loads(self.__fw_new["cfg"], object_pairs_hook=OrderedDict)
@@ -302,21 +300,23 @@ class CANedge(object):
 
             res = {"res": CANedgeReturnCodes.OK, "id": device["id"], "removed": []}
 
-            for obj in self.mc.list_objects(self.bucket, prefix=device["id"] + '/', recursive=False):
+            paginator = self.s3.get_paginator('list_objects_v2')
+            for result in paginator.paginate(Bucket=self.bucket, Prefix=device["id"] + '/'):
+                for obj in result.get('Contents', []):
 
-                # Config (including the config-XX.XX.json from dry runs)
-                r = re.search(r'^[A-F0-9]{8}/(config-\w{2}\.\w{2}\.json)$', obj.object_name)
-                if r:
-                    if (r[1] != self.__fw_old["cfg_name"]) and (r[1] != self.__fw_new["cfg_name"]):
-                        self.mc.remove_object(self.bucket, obj.object_name)
-                        res["removed"].append(r[1])
+                    # Config (including the config-XX.XX.json from dry runs)
+                    r = re.search(r'^[A-F0-9]{8}/(config-\w{2}\.\w{2}\.json)$', obj['Key'])
+                    if r:
+                        if (r[1] != self.__fw_old["cfg_name"]) and (r[1] != self.__fw_new["cfg_name"]):
+                            self.s3.delete_object(Bucket=self.bucket, Key=obj['Key'])
+                            res["removed"].append(r[1])
 
-                # Schema
-                r = re.search(r'^[A-F0-9]{8}/(schema-\d{2}\.\d{2}\.json)$', obj.object_name)
-                if r:
-                    if (r[1] != self.__fw_old["sch_name"]) and (r[1] != self.__fw_new["sch_name"]):
-                        self.mc.remove_object(self.bucket, obj.object_name)
-                        res["removed"].append(r[1])
+                    # Schema
+                    r = re.search(r'^[A-F0-9]{8}/(schema-\d{2}\.\d{2}\.json)$', obj['Key'])
+                    if r:
+                        if (r[1] != self.__fw_old["sch_name"]) and (r[1] != self.__fw_new["sch_name"]):
+                            self.s3.delete_object(Bucket=self.bucket, Key=obj['Key'])
+                            res["removed"].append(r[1])
 
             yield res
 
@@ -342,13 +342,14 @@ class CANedge(object):
 
             # Check that a valid configuration file is present
             try:
-                self.mc.stat_object(self.bucket, device["id"] + '/' + self.__fw_new["cfg_name"])
+                self.s3.head_object(Bucket=self.bucket, Key=device["id"] + '/' + self.__fw_new["cfg_name"])
             except Exception as e:
                 res["res"] = CANedgeReturnCodes.CONFIG_NOT_FOUND_ERROR
                 yield res
                 continue
 
             # Put firmware
-            self.mc.fput_object(self.bucket, device["id"] + '/firmware.bin', self.fw_new_path)
+            with open(self.fw_new_path, 'rb') as file:
+                self.s3.upload_fileobj(file, self.bucket, device["id"] + '/firmware.bin')
 
             yield res
