@@ -6,11 +6,14 @@ from typing import Generator, Dict
 from jsonschema import validate, ValidationError
 from collections import OrderedDict
 from base64 import b64encode, b64decode
-from Crypto.PublicKey import ECC
-from Crypto.Hash import HMAC, SHA256
-from Crypto.Cipher import AES
-from Crypto.Util import Counter
-from Crypto.Random import get_random_bytes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from base64 import b64encode, b64decode
+import os
 import boto3
 
 
@@ -24,54 +27,54 @@ class CANedgeReturnCodes(IntEnum):
 
 class CANEdgeSecurity(object):
 
-    # Generate a new symmetric key using device public key
     @staticmethod
     def __gen_sym_key(device_public_key_string_xy):
 
-        _ECC_CURVE = 'secp256r1'
+        # Extract x and y from device public key
+        x_bytes = device_public_key_string_xy[:32]
+        y_bytes = device_public_key_string_xy[32:]
+        x = int.from_bytes(x_bytes, byteorder='big')
+        y = int.from_bytes(y_bytes, byteorder='big')
 
-        # Construct ECC point from device public key
-        device_kpub_int_x = int.from_bytes(device_public_key_string_xy[:32], byteorder='big')
-        device_kpub_int_y = int.from_bytes(device_public_key_string_xy[32:], byteorder='big')
-        device_kpub_p = ECC.construct(curve=_ECC_CURVE, point_x=device_kpub_int_x, point_y=device_kpub_int_y)
+        # Reconstruct ECC public key
+        device_pub_numbers = ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1())
+        device_pub_key = device_pub_numbers.public_key(default_backend())
 
-        # Create user private / public key pair
-        user_key_pair = ECC.generate(curve=_ECC_CURVE)
+        # Generate user's ECC private key
+        user_private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
+        user_public_key = user_private_key.public_key()
 
-        # The shared secret is calculated using the device public point and the private key.
-        # The secret is the x-coordinate of the resulting point
-        shared_secret_int = (device_kpub_p.pointQ * user_key_pair.d).x
+        # Perform ECDH to generate shared secret
+        shared_secret = user_private_key.exchange(ec.ECDH(), device_pub_key)
 
-        # Calculate symmetric key from shared secret using hmac-sha256 and static data "config"
-        shared_secret_string = int(shared_secret_int).to_bytes(32, byteorder='big')
-        h = HMAC.new(shared_secret_string, msg=b'config', digestmod=SHA256)
+        # Derive symmetric key using HMAC-SHA256 (manually to match original logic)
+        h = hmac.HMAC(shared_secret, hashes.SHA256(), backend=default_backend())
+        h.update(b'config')
+        digest = h.finalize()
+        symmetric_key = digest[:16]  # Truncate to 128-bit AES key
 
-        # Truncate to get shared private key (16 bytes)
-        symmetric_key = h.digest()[0:16]
-
-        # Create public key byte strings
-        user_kpub_string_x = int(user_key_pair.pointQ.x).to_bytes(32, byteorder='big')
-        user_kpub_string_y = int(user_key_pair.pointQ.y).to_bytes(32, byteorder='big')
+        # Export user public key (raw x and y bytes)
+        user_public_numbers = user_public_key.public_numbers()
+        user_kpub_string_x = user_public_numbers.x.to_bytes(32, byteorder='big')
+        user_kpub_string_y = user_public_numbers.y.to_bytes(32, byteorder='big')
 
         return symmetric_key, user_kpub_string_x + user_kpub_string_y
 
     def __init__(self, device_public_key_base64: str):
-
-        # Generate shared secret (symmetric key)
         self.device_public_key_base64 = device_public_key_base64
         self.device_kpub_string_xy = b64decode(self.device_public_key_base64)
         self.ksym, self.user_kpub_string_xy = self.__gen_sym_key(self.device_kpub_string_xy)
 
     def encrypt_encode(self, field_value: str) -> str:
-        # Create CTR cipher (the library creates a random nonce)
-        iv = get_random_bytes(16)
-        ctr = Counter.new(128, initial_value=int.from_bytes(iv, byteorder='big'))
-        cipher = AES.new(self.ksym, AES.MODE_CTR, counter=ctr)
+        # Generate a 16-byte IV (used as nonce for CTR)
+        iv = os.urandom(16)
+        cipher = Cipher(algorithms.AES(self.ksym), modes.CTR(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
 
-        # Encrypt data
-        ct = cipher.encrypt(bytes(field_value, 'ascii'))
+        # Encrypt
+        ct = encryptor.update(field_value.encode('ascii')) + encryptor.finalize()
 
-        # Concatenate and encode
+        # Return base64-encoded IV + ciphertext
         return b64encode(iv + ct).decode()
 
     @property

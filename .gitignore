@@ -2,3 +2,5 @@
 *.pyc
 venv/
 readme-example.py
+servers-aws.json
+firmware.bin
